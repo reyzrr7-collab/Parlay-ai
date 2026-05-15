@@ -1,53 +1,113 @@
-from data.odds import find_odds_for_match, remove_vig
-import os
+"""
+parlay/value_bet.py
+───────────────────
+Deteksi value bet & manajemen bankroll:
+- Hitung edge antara model vs pasar
+- Kelly Criterion untuk ukuran bet optimal
+- Filter berdasarkan expected value (EV)
+"""
 
-MIN_EDGE = float(os.getenv("MIN_EDGE", 0.05))
+import logging
+from typing import Optional
+from data.odds import odds_to_prob
+
+log = logging.getLogger("value_bet")
+
+EDGE_THRESHOLD = 0.04   # min 4% edge untuk dianggap value bet
+MIN_KELLY      = 0.01   # min kelly fraction (1% bankroll)
+MAX_KELLY      = 0.10   # max kelly fraction (10% bankroll — safety cap)
 
 
-def detect_edge(model_prob: float, market_prob: float) -> float:
-    """Hitung edge: selisih probabilitas model vs pasar."""
+def calculate_edge(model_prob: float, market_odds: float) -> float:
+    """
+    Hitung edge = selisih probabilitas model vs pasar.
+    Positif = model lebih optimis → value bet
+    """
+    if market_odds <= 1.0:
+        return 0.0
+    market_prob = 1 / market_odds
     return round(model_prob - market_prob, 4)
 
 
-def find_value_bet(prediction: dict, home_team: str, away_team: str, sport: str = "soccer_epl") -> dict:
+def kelly_criterion(model_prob: float, odds: float,
+                    fraction: float = 0.5) -> float:
     """
-    Bandingkan prediksi model vs true probability Pinnacle.
-    Return dict dengan info value bet.
+    Kelly Criterion — hitung ukuran bet optimal.
+    fraction=0.5 → Half-Kelly (lebih konservatif, direkomendasikan).
+
+    Rumus: f = (p * b - q) / b
+    p = probabilitas menang, q = probabilitas kalah, b = net odds
     """
-    odds = find_odds_for_match(home_team, away_team, sport)
-    true_h, true_d, true_a = remove_vig(odds.get("home"), odds.get("draw"), odds.get("away"))
+    if odds <= 1.0 or model_prob <= 0:
+        return 0.0
 
-    if true_h is None:
-        return {"value_bet": False, "edge": 0, "reason": "Odds tidak tersedia"}
+    b = odds - 1  # net odds
+    q = 1 - model_prob
+    kelly = (model_prob * b - q) / b
 
-    edges = {
-        "home_win": detect_edge(prediction["home_win"], true_h),
-        "draw": detect_edge(prediction["draw"], true_d),
-        "away_win": detect_edge(prediction["away_win"], true_a),
-    }
+    if kelly <= 0:
+        return 0.0
 
-    best_outcome = max(edges, key=edges.get)
-    best_edge = edges[best_outcome]
-
-    if best_edge > MIN_EDGE:
-        return {
-            "value_bet": True,
-            "best_outcome": best_outcome,
-            "edge": best_edge,
-            "odds": odds.get(best_outcome.split("_")[0], odds.get("home")),
-            "model_prob": prediction.get(best_outcome, 0),
-            "market_prob": {"home_win": true_h, "draw": true_d, "away_win": true_a}.get(best_outcome, 0),
-            "all_edges": edges
-        }
-
-    return {
-        "value_bet": False,
-        "edge": best_edge,
-        "best_outcome": best_outcome,
-        "all_edges": edges
-    }
+    # Terapkan fraction & cap
+    kelly_adjusted = kelly * fraction
+    return round(min(kelly_adjusted, MAX_KELLY), 4)
 
 
 def expected_value(model_prob: float, odds: float) -> float:
-    """Hitung expected value dari bet."""
+    """
+    Expected Value = (prob × odds) - 1
+    EV > 0 → menguntungkan jangka panjang
+    """
     return round((model_prob * odds) - 1, 4)
+
+
+def analyze_value(
+    prediction:  str,
+    model_prob:  float,
+    market_odds: dict,  # {"home": x, "draw": x, "away": x}
+) -> dict:
+    """
+    Analisis value bet lengkap untuk satu prediksi.
+    Return: edge, kelly, EV, is_value
+    """
+    if not market_odds:
+        return {"is_value": False, "edge": 0, "kelly": 0, "ev": 0}
+
+    # Ambil odds sesuai prediksi
+    pred_lower = prediction.lower()
+    if "home" in pred_lower:
+        odds = market_odds.get("home", 0)
+    elif "away" in pred_lower:
+        odds = market_odds.get("away", 0)
+    else:
+        odds = market_odds.get("draw", 0)
+
+    if not odds or odds <= 1.0:
+        return {"is_value": False, "edge": 0, "kelly": 0, "ev": 0}
+
+    edge = calculate_edge(model_prob, odds)
+    ev   = expected_value(model_prob, odds)
+    kel  = kelly_criterion(model_prob, odds) if edge > EDGE_THRESHOLD else 0.0
+
+    return {
+        "is_value":   edge > EDGE_THRESHOLD,
+        "edge":       round(edge * 100, 2),   # dalam %
+        "edge_raw":   edge,
+        "ev":         round(ev * 100, 2),     # dalam %
+        "kelly":      kel,
+        "kelly_pct":  round(kel * 100, 2),
+        "odds":       odds,
+        "model_prob": round(model_prob * 100, 1),
+        "market_prob": round((1/odds) * 100, 1) if odds > 0 else 0,
+    }
+
+
+def overround(odds_home: float, odds_draw: float, odds_away: float) -> float:
+    """
+    Hitung overround (margin) bookmaker.
+    Semakin rendah = pasar lebih efisien.
+    Pinnacle biasanya ~2-3%, bookie biasa ~8-12%.
+    """
+    if not all([odds_home, odds_draw, odds_away]):
+        return 0.0
+    return round(((1/odds_home + 1/odds_draw + 1/odds_away) - 1) * 100, 2)

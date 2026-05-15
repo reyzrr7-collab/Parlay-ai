@@ -1,101 +1,121 @@
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, JSON
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+"""
+database/models.py
+─────────────────
+Inisialisasi semua tabel SQLite untuk:
+- Memory percakapan agent
+- Profil & fakta user
+- Log prediksi (feedback loop)
+- Log parlay
+"""
+
 import os
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
+log = logging.getLogger("database")
 
-DB_URL = f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
-
-engine = create_engine(DB_URL)
-Session = sessionmaker(bind=engine)
-Base = declarative_base()
-
-
-class Match(Base):
-    __tablename__ = "matches"
-
-    id = Column(Integer, primary_key=True)
-    api_match_id = Column(Integer, unique=True)
-    home_team = Column(String)
-    away_team = Column(String)
-    league = Column(String)
-    match_date = Column(DateTime)
-    home_score = Column(Integer, nullable=True)
-    away_score = Column(Integer, nullable=True)
-    status = Column(String, default="scheduled")
-    created_at = Column(DateTime, default=datetime.utcnow)
+# ── Auto-detect: PostgreSQL (Railway) atau SQLite (lokal) ────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+USE_POSTGRES  = DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres")
 
 
-class MatchData(Base):
-    __tablename__ = "match_data"
-
-    id = Column(Integer, primary_key=True)
-    match_id = Column(Integer)
-    home_form = Column(JSON)
-    away_form = Column(JSON)
-    h2h = Column(JSON)
-    home_xg_avg = Column(Float)
-    away_xg_avg = Column(Float)
-    home_lineup = Column(JSON)
-    away_lineup = Column(JSON)
-    injuries = Column(JSON)
-    home_odds = Column(Float)
-    draw_odds = Column(Float)
-    away_odds = Column(Float)
-    weather = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
+def get_conn():
+    """Return koneksi DB — otomatis pilih PostgreSQL atau SQLite."""
+    if USE_POSTGRES:
+        import psycopg2
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        return psycopg2.connect(url)
+    else:
+        import sqlite3
+        return sqlite3.connect("agent_memory.db")
 
 
-class Prediction(Base):
-    __tablename__ = "predictions"
+def _serial(use_postgres: bool) -> str:
+    return "SERIAL PRIMARY KEY" if use_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
-    id = Column(Integer, primary_key=True)
-    match_id = Column(Integer)
-    home_win_prob = Column(Float)
-    draw_prob = Column(Float)
-    away_win_prob = Column(Float)
-    predicted_outcome = Column(String)
-    confidence = Column(Float)
-    edge = Column(Float)
-    value_bet = Column(Boolean, default=False)
-    model_breakdown = Column(JSON)
-    agent_reasoning = Column(String)
-    red_flag = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+def _now(use_postgres: bool) -> str:
+    return "NOW()" if use_postgres else "CURRENT_TIMESTAMP"
 
 
-class Parlay(Base):
-    __tablename__ = "parlays"
+def init_db() -> None:
+    conn = get_conn()
+    c = conn.cursor()
+    s = _serial(USE_POSTGRES)
 
-    id = Column(Integer, primary_key=True)
-    match_ids = Column(JSON)
-    legs = Column(Integer)
-    cumulative_prob = Column(Float)
-    combined_odds = Column(Float)
-    selections = Column(JSON)
-    result = Column(String, nullable=True)
-    roi = Column(Float, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    c.execute(f'''
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            id          {s},
+            session_id  TEXT        NOT NULL,
+            role        TEXT        NOT NULL,
+            content     TEXT        NOT NULL,
+            timestamp   TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
 
+    c.execute(f'''
+        CREATE TABLE IF NOT EXISTS user_context (
+            session_id  TEXT PRIMARY KEY,
+            user_name   TEXT,
+            preferences TEXT,
+            last_active TIMESTAMP
+        )
+    ''')
 
-class EvaluationLog(Base):
-    __tablename__ = "evaluation_logs"
+    c.execute(f'''
+        CREATE TABLE IF NOT EXISTS user_facts (
+            id          {s},
+            session_id  TEXT NOT NULL,
+            fact_key    TEXT NOT NULL,
+            fact_value  TEXT NOT NULL,
+            source      TEXT,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(session_id, fact_key)
+        )
+    ''')
 
-    id = Column(Integer, primary_key=True)
-    prediction_id = Column(Integer)
-    actual_outcome = Column(String)
-    correct = Column(Boolean)
-    brier_score = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    c.execute(f'''
+        CREATE TABLE IF NOT EXISTS prediction_log (
+            id               {s},
+            match_id         TEXT,
+            match_name       TEXT NOT NULL,
+            league           TEXT,
+            prediction       TEXT NOT NULL,
+            pick_type        TEXT,
+            confidence       FLOAT,
+            model_prob_home  FLOAT,
+            model_prob_draw  FLOAT,
+            model_prob_away  FLOAT,
+            dixon_home       FLOAT,
+            dixon_draw       FLOAT,
+            dixon_away       FLOAT,
+            xgb_home         FLOAT,
+            xgb_draw         FLOAT,
+            xgb_away         FLOAT,
+            pinnacle_prob    FLOAT,
+            edge             FLOAT,
+            kelly_fraction   FLOAT,
+            actual_result    TEXT,
+            was_correct      INTEGER,
+            brier_score      FLOAT,
+            predicted_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            evaluated_at     TIMESTAMP
+        )
+    ''')
 
+    c.execute(f'''
+        CREATE TABLE IF NOT EXISTS parlay_log (
+            id              {s},
+            picks_json      TEXT NOT NULL,
+            total_legs      INTEGER,
+            cum_probability FLOAT,
+            all_correct     INTEGER,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            evaluated_at    TIMESTAMP
+        )
+    ''')
 
-def init_db():
-    Base.metadata.create_all(engine)
-    print("Database tables created successfully.")
-
-
-if __name__ == "__main__":
-    init_db()
+    conn.commit()
+    conn.close()
+    mode = "PostgreSQL" if USE_POSTGRES else "SQLite"
+    log.info("✅ Database diinisialisasi (%s) — 5 tabel.", mode)

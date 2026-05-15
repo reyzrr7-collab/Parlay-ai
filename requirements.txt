@@ -1,21 +1,41 @@
-openai
+# Environment
+python-dotenv
+
+# HTTP
+requests
+aiohttp
+
+# Data processing
+pandas
+numpy
+scipy
+
+# Machine Learning
+xgboost
+scikit-learn
+
+# Bayesian
+pymc
+pytensor
+
+# Scraping
+understat
+beautifulsoup4
+lxml
+
+# AI & Agent
 langchain
 langchain-openai
 langgraph
-pymc
-xgboost
-scikit-learn
-scipy
-pandas
-numpy
-requests
-beautifulsoup4
-psycopg2-binary
-redis
-python-dotenv
+
+# Web search
+tavily-python
+
+# Telegram
+python-telegram-bot
+
+# Scheduler
 schedule
-fastapi
-uvicorn
-sqlalchemy
-aiohttp
-lxml
+
+# Database
+psycopg2-binary

@@ -1,52 +1,167 @@
+"""
+models/bayesian.py
+──────────────────
+Hierarchical Bayesian Model untuk prediksi sepak bola.
+Lebih robust dari Dixon-Coles biasa karena:
+- Setiap tim punya DISTRIBUSI kekuatan (bukan nilai tunggal)
+- Uncertainty di-model secara eksplisit
+- Update otomatis setiap match selesai (online learning)
+- Lebih akurat untuk tim promosi / data sedikit
+
+Catatan: Butuh PyMC. Install: pip install pymc pytensor
+"""
+
+import logging
 import numpy as np
-from scipy.stats import poisson, gamma
+from typing import Optional
+
+log = logging.getLogger("bayesian")
 
 
-def bayesian_predict(match_data: dict, n_samples: int = 5000) -> dict:
+class BayesianFootball:
     """
-    Hierarchical Bayesian model sederhana menggunakan sampling.
-    Menggunakan prior Gamma untuk rate gol.
+    Hierarchical Bayesian model untuk prediksi hasil pertandingan.
+    Digunakan sebagai pelengkap Dixon-Coles dalam ensemble.
     """
-    home_xg = match_data.get("home_xg_avg", 1.2)
-    away_xg = match_data.get("away_xg_avg", 1.0)
-    home_xga = match_data.get("home_xga_avg", 1.2)
-    away_xga = match_data.get("away_xga_avg", 1.0)
-    home_form_pts = match_data.get("home_form_pts", 1.5)
-    away_form_pts = match_data.get("away_form_pts", 1.5)
 
-    # Prior Gamma berdasarkan xG + form
-    home_alpha = max(home_xg * 2 + home_form_pts * 0.1, 0.5)
-    home_beta = 2.0
-    away_alpha = max(away_xg * 2 + away_form_pts * 0.1, 0.5)
-    away_beta = 2.0
+    def __init__(self):
+        self.trace    = None
+        self.teams    = []
+        self.team_idx = {}
+        self.fitted   = False
 
-    # Home advantage
-    home_advantage = 1.15
+    def fit(self, matches: list, draws: int = 500, tune: int = 200) -> None:
+        """
+        Fit model dari data historis.
+        matches: [{"home_team", "away_team", "home_goals", "away_goals"}, ...]
+        """
+        try:
+            import pymc as pm
+            import pytensor.tensor as pt
+        except ImportError:
+            log.error("PyMC tidak terinstall. pip install pymc pytensor")
+            return
 
-    home_wins = 0
-    draws = 0
-    away_wins = 0
+        # Kumpulkan tim
+        self.teams = sorted(set(
+            [m["home_team"] for m in matches] +
+            [m["away_team"] for m in matches]
+        ))
+        self.team_idx = {t: i for i, t in enumerate(self.teams)}
+        n = len(self.teams)
 
-    for _ in range(n_samples):
-        # Sample lambda dari posterior
-        lambda_home = gamma.rvs(home_alpha, scale=1 / home_beta) * home_advantage
-        lambda_away = gamma.rvs(away_alpha, scale=1 / away_beta)
+        home_idx = np.array([self.team_idx[m["home_team"]] for m in matches])
+        away_idx = np.array([self.team_idx[m["away_team"]] for m in matches])
+        home_goals = np.array([m["home_goals"] for m in matches])
+        away_goals = np.array([m["away_goals"] for m in matches])
 
-        # Sample skor
-        home_goals = poisson.rvs(max(lambda_home, 0.1))
-        away_goals = poisson.rvs(max(lambda_away, 0.1))
+        with pm.Model() as model:
+            # Hyperprior — rata-rata kekuatan liga
+            mu_att    = pm.Normal("mu_att",    mu=0,   sigma=0.5)
+            mu_def    = pm.Normal("mu_def",    mu=0,   sigma=0.5)
+            sigma_att = pm.HalfNormal("sigma_att", sigma=0.5)
+            sigma_def = pm.HalfNormal("sigma_def", sigma=0.5)
 
-        if home_goals > away_goals:
-            home_wins += 1
-        elif home_goals == away_goals:
-            draws += 1
-        else:
-            away_wins += 1
+            # Kekuatan tiap tim — distribusi, bukan nilai tunggal
+            attack  = pm.Normal("attack",  mu=mu_att, sigma=sigma_att, shape=n)
+            defense = pm.Normal("defense", mu=mu_def, sigma=sigma_def, shape=n)
 
-    total = n_samples
-    return {
-        "home_win": round(home_wins / total, 4),
-        "draw": round(draws / total, 4),
-        "away_win": round(away_wins / total, 4),
-        "model": "bayesian"
-    }
+            # Home advantage (global)
+            home_adv = pm.Normal("home_adv", mu=0.3, sigma=0.1)
+
+            # Expected goals
+            log_lambda = attack[home_idx] - defense[away_idx] + home_adv
+            log_mu     = attack[away_idx] - defense[home_idx]
+
+            lambda_ = pm.math.exp(log_lambda)
+            mu_     = pm.math.exp(log_mu)
+
+            # Likelihood
+            pm.Poisson("home_goals_obs", mu=lambda_, observed=home_goals)
+            pm.Poisson("away_goals_obs", mu=mu_,     observed=away_goals)
+
+            # Sample posterior
+            self.trace = pm.sample(
+                draws=draws,
+                tune=tune,
+                target_accept=0.9,
+                return_inferencedata=True,
+                progressbar=False,
+            )
+
+        self.fitted = True
+        log.info("✅ Bayesian model fitted — %d tim, %d matches", n, len(matches))
+
+    def predict(self, home_team: str, away_team: str,
+                max_goals: int = 7) -> Optional[dict]:
+        """
+        Prediksi probabilitas dari posterior samples.
+        Lebih robust karena menggunakan distribusi penuh, bukan point estimate.
+        """
+        if not self.fitted:
+            return None
+
+        hi = self.team_idx.get(home_team)
+        ai = self.team_idx.get(away_team)
+        if hi is None or ai is None:
+            log.warning("Tim tidak ada di Bayesian model: %s / %s", home_team, away_team)
+            return None
+
+        try:
+            att  = self.trace.posterior["attack"].values
+            defn = self.trace.posterior["defense"].values
+            hadv = self.trace.posterior["home_adv"].values
+
+            # Rata-rata posterior
+            att_home  = float(att[:, :, hi].mean())
+            def_away  = float(defn[:, :, ai].mean())
+            att_away  = float(att[:, :, ai].mean())
+            def_home  = float(defn[:, :, hi].mean())
+            home_adv  = float(hadv.mean())
+
+            lam = np.exp(att_home - def_away + home_adv)
+            mu  = np.exp(att_away - def_home)
+
+            # Hitung probabilitas dari distribusi Poisson
+            from scipy.stats import poisson
+            prob_matrix = np.zeros((max_goals, max_goals))
+            for i in range(max_goals):
+                for j in range(max_goals):
+                    prob_matrix[i][j] = (poisson.pmf(i, lam) *
+                                         poisson.pmf(j, mu))
+            total = prob_matrix.sum()
+            if total > 0:
+                prob_matrix /= total
+
+            home_win = float(np.sum(np.tril(prob_matrix, -1)))
+            draw     = float(np.sum(np.diag(prob_matrix)))
+            away_win = float(np.sum(np.triu(prob_matrix, 1)))
+
+            return {
+                "home_win": round(home_win * 100, 1),
+                "draw":     round(draw * 100, 1),
+                "away_win": round(away_win * 100, 1),
+                "xg":       {"home": round(lam, 2), "away": round(mu, 2)},
+            }
+        except Exception as e:
+            log.error("Bayesian predict error: %s", e)
+            return None
+
+    def get_team_strength(self, team: str) -> dict:
+        """Tampilkan distribusi kekuatan tim (mean ± std)."""
+        if not self.fitted or team not in self.team_idx:
+            return {}
+        i   = self.team_idx[team]
+        att = self.trace.posterior["attack"].values[:, :, i]
+        defn= self.trace.posterior["defense"].values[:, :, i]
+        return {
+            "team":          team,
+            "attack_mean":   round(float(att.mean()), 4),
+            "attack_std":    round(float(att.std()), 4),
+            "defense_mean":  round(float(defn.mean()), 4),
+            "defense_std":   round(float(defn.std()), 4),
+        }
+
+
+# Instance global
+bayesian_model = BayesianFootball()

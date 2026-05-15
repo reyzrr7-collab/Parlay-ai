@@ -1,121 +1,108 @@
-from itertools import combinations
-from parlay.filter import filter_candidates, rank_candidates
-import os
+"""
+parlay/generator.py
+───────────────────
+Build kombinasi parlay optimal dari kandidat terpilih:
+- Hitung kumulatif probabilitas
+- Hitung expected value parlay
+- GO/NO-GO recommendation
+"""
 
-MAX_LEGS = int(os.getenv("MAX_PARLAY_LEGS", 4))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", 0.65))
+import math
+import logging
+from typing import List, Dict
+from parlay.filter import filter_parlay_candidates
+from parlay.value_bet import analyze_value
 
+log = logging.getLogger("generator")
 
-def calculate_cumulative_prob(selections: list) -> float:
-    """Hitung probabilitas kumulatif parlay."""
-    prob = 1.0
-    for s in selections:
-        prob *= s["confidence"]
-    return round(prob, 4)
-
-
-def calculate_combined_odds(selections: list) -> float:
-    """Hitung combined odds parlay."""
-    odds = 1.0
-    for s in selections:
-        odds *= s.get("odds", 1.0)
-    return round(odds, 3)
+MIN_CUM_PROB  = 20.0  # % minimum kumulatif untuk GO
+MIN_LEGS      = 2     # minimum kaki parlay
 
 
-def calculate_ev(cumulative_prob: float, combined_odds: float) -> float:
-    """Expected value parlay."""
-    return round((cumulative_prob * combined_odds) - 1, 4)
-
-
-def generate_optimal_parlay(predictions: list) -> dict:
+def calculate_parlay_odds(picks: List[dict]) -> float:
     """
-    Generate kombinasi parlay optimal dari semua kandidat.
-    
-    1. Filter kandidat layak
-    2. Rank berdasarkan edge x confidence
-    3. Cari kombinasi dengan EV tertinggi
-    4. Return parlay terbaik
+    Hitung total odds parlay (perkalian semua odds).
     """
-    candidates = filter_candidates(predictions)
-    candidates = rank_candidates(candidates)
-
-    if not candidates:
-        return {"status": "no_parlay", "reason": "Tidak ada kandidat yang memenuhi kriteria"}
-
-    best_parlay = None
-    best_ev = -999
-
-    # Coba semua kombinasi dari 2 sampai MAX_LEGS
-    for n_legs in range(2, min(MAX_LEGS + 1, len(candidates) + 1)):
-        for combo in combinations(candidates, n_legs):
-            selections = []
-            for c in combo:
-                selections.append({
-                    "match": f"{c['home_team']} vs {c['away_team']}",
-                    "pick": c["predicted_outcome"],
-                    "confidence": c["confidence"],
-                    "odds": c.get("odds", 1.9),
-                    "edge": c.get("edge", 0)
-                })
-
-            cum_prob = calculate_cumulative_prob(selections)
-            if cum_prob < MIN_CONFIDENCE:
-                continue
-
-            combined_odds = calculate_combined_odds(selections)
-            ev = calculate_ev(cum_prob, combined_odds)
-
-            if ev > best_ev:
-                best_ev = ev
-                best_parlay = {
-                    "status": "parlay_found",
-                    "legs": n_legs,
-                    "selections": selections,
-                    "cumulative_prob": cum_prob,
-                    "combined_odds": combined_odds,
-                    "expected_value": ev
-                }
-
-    if not best_parlay:
-        # Ambil top 2 jika tidak ada kombinasi yang memenuhi threshold prob
-        top2 = candidates[:2]
-        if len(top2) >= 2:
-            selections = [{
-                "match": f"{c['home_team']} vs {c['away_team']}",
-                "pick": c["predicted_outcome"],
-                "confidence": c["confidence"],
-                "odds": c.get("odds", 1.9),
-                "edge": c.get("edge", 0)
-            } for c in top2]
-            best_parlay = {
-                "status": "parlay_low_prob",
-                "legs": 2,
-                "selections": selections,
-                "cumulative_prob": calculate_cumulative_prob(selections),
-                "combined_odds": calculate_combined_odds(selections),
-                "expected_value": calculate_ev(calculate_cumulative_prob(selections), calculate_combined_odds(selections))
-            }
-        else:
-            return {"status": "no_parlay", "reason": "Kandidat tidak cukup"}
-
-    return best_parlay
+    total = 1.0
+    for pick in picks:
+        total *= pick.get("odds", 1.0)
+    return round(total, 2)
 
 
-def print_parlay(parlay: dict):
-    """Print parlay dengan format yang mudah dibaca."""
-    if parlay["status"] == "no_parlay":
-        print(f"\n❌ TIDAK ADA PARLAY: {parlay['reason']}")
-        return
+def calculate_cumulative_prob(picks: List[dict]) -> float:
+    """
+    Hitung probabilitas kumulatif parlay.
+    Asumsi: setiap pertandingan independen.
+    """
+    cum = 1.0
+    for pick in picks:
+        cum *= pick.get("confidence", 50) / 100
+    return round(cum * 100, 2)
 
-    print("\n" + "="*50)
-    print("🎯 PARLAY REKOMENDASI")
-    print("="*50)
-    for i, sel in enumerate(parlay["selections"], 1):
-        print(f"{i}. {sel['match']}")
-        print(f"   Pick: {sel['pick']} | Conf: {sel['confidence']:.1%} | Odds: {sel['odds']} | Edge: {sel['edge']:.1%}")
-    print("-"*50)
-    print(f"Legs          : {parlay['legs']}")
-    print(f"Combined Odds : {parlay['combined_odds']}")
-    print(f"Cumul. Prob   : {parlay['cumulative_prob']:.1%}")
-    print(f"Expected Value: {parlay['expected_value']:+.1%}")
-    print("="*50)
+
+def parlay_expected_value(cum_prob: float, total_odds: float) -> float:
+    """
+    EV parlay = (cum_prob × total_odds) - 1
+    """
+    return round((cum_prob / 100) * total_odds - 1, 4)
+
+
+def generate_parlay(matches: List[dict]) -> dict:
+    """
+    Generate rekomendasi parlay dari list pertandingan.
+
+    Alur:
+    1. Filter candidates
+    2. Ambil top picks
+    3. Hitung probabilitas kumulatif
+    4. GO/NO-GO decision
+    5. Return lengkap dengan reasoning
+    """
+    # Filter
+    filtered = filter_parlay_candidates(matches)
+    picks = filtered["accepted"]
+
+    if len(picks) < MIN_LEGS:
+        return {
+            "status":     "NO-GO",
+            "reason":     f"Hanya {len(picks)} match lolos filter (min {MIN_LEGS})",
+            "picks":      [],
+            "rejected":   filtered["rejected"],
+        }
+
+    # Hitung odds & probabilitas
+    total_odds  = calculate_parlay_odds(picks)
+    cum_prob    = calculate_cumulative_prob(picks)
+    ev          = parlay_expected_value(cum_prob, total_odds)
+
+    # GO/NO-GO
+    go = cum_prob >= MIN_CUM_PROB and ev > 0
+
+    return {
+        "status":          "✅ GO" if go else "❌ NO-GO",
+        "go":              go,
+        "total_legs":      len(picks),
+        "total_odds":      total_odds,
+        "cum_probability": cum_prob,
+        "expected_value":  round(ev * 100, 2),   # dalam %
+        "picks":           picks,
+        "rejected":        filtered["rejected"],
+        "summary":         _generate_summary(picks, cum_prob, total_odds, ev),
+    }
+
+
+def _generate_summary(picks: list, cum_prob: float,
+                       total_odds: float, ev: float) -> str:
+    lines = ["📊 PARLAY SUMMARY", "─" * 40]
+    for i, p in enumerate(picks, 1):
+        lines.append(
+            f"{i}. {p.get('match_name','?')} → {p.get('prediction','?')} "
+            f"({p.get('confidence',0)}%) @ {p.get('odds',0):.2f}"
+        )
+    lines += [
+        "─" * 40,
+        f"Total Odds      : {total_odds}x",
+        f"Kumulatif Prob  : {cum_prob}%",
+        f"Expected Value  : {round(ev*100, 1)}%",
+    ]
+    return "\n".join(lines)
